@@ -7,8 +7,8 @@ from dotenv import load_dotenv
 # --- CONFIGURATION ---
 load_dotenv()
 TOKEN = os.getenv('DISCORD_TOKEN')
-WORKER_CHANNEL_ID = 1497993985837498402 
-ADMIN_ID = 930518448268804096          
+# This is your unique ID (Yahya) for "Super Admin" actions like clearing the whole database
+OWNER_ID = 930518448268804096 
 
 # --- DATABASE LAYER ---
 def init_db():
@@ -17,6 +17,7 @@ def init_db():
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS projects (
             ticket_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            guild_id INTEGER,
             client_name TEXT,
             title TEXT,
             details TEXT,
@@ -33,38 +34,37 @@ def init_db():
     conn.commit()
     conn.close()
 
-# --- PROFESSIONAL UI COMPONENTS ---
-class ProjectForm(ui.Modal, title='New Project Intake'):
-    title = ui.TextInput(label='Project Title', placeholder='e.g. YouTube Edit, 5x Thumbnails...')
-    details = ui.TextInput(label='Requirements & Links', style=discord.TextStyle.paragraph, placeholder='Instructions for the worker...')
-    deadline = ui.TextInput(label='Hard Deadline', placeholder='e.g. Friday 6PM IST')
-    budget = ui.TextInput(label='Base Budget (₹)', placeholder='e.g. 1500')
+# --- UI COMPONENTS ---
+class ProjectForm(ui.Modal, title='Project Intake'):
+    title_input = ui.TextInput(label='Project Title', placeholder='Video Edit, Scripting...')
+    details = ui.TextInput(label='Requirements', style=discord.TextStyle.paragraph)
+    deadline = ui.TextInput(label='Deadline', placeholder='e.g. Tomorrow 5PM')
+    budget = ui.TextInput(label='Budget (₹)', placeholder='1000')
 
     async def on_submit(self, interaction: discord.Interaction):
         try:
             conn = sqlite3.connect('business_ledger.db')
             cursor = conn.cursor()
-            cursor.execute('''INSERT INTO projects (client_name, title, details, deadline, base_pay) 
-                              VALUES (?, ?, ?, ?, ?)''', 
-                           (interaction.user.name, self.title.value, self.details.value, self.deadline.value, float(self.budget.value)))
+            cursor.execute('''INSERT INTO projects (guild_id, client_name, title, details, deadline, base_pay) 
+                              VALUES (?, ?, ?, ?, ?, ?)''', 
+                           (interaction.guild_id, interaction.user.name, self.title_input.value, 
+                            self.details.value, self.deadline.value, float(self.budget.value)))
             t_id = cursor.lastrowid
             
-            embed = discord.Embed(title=f"📋 NEW JOB: #{t_id}", color=discord.Color.blue())
-            embed.add_field(name="Project", value=self.title.value, inline=False)
-            embed.add_field(name="Deadline", value=self.deadline.value, inline=True)
+            embed = discord.Embed(title=f"📋 JOB: #{t_id}", color=discord.Color.blue())
+            embed.add_field(name="Project", value=self.title_input.value, inline=False)
             embed.add_field(name="Budget", value=f"₹{self.budget.value}", inline=True)
             embed.add_field(name="Details", value=self.details.value, inline=False)
-            embed.set_footer(text="WORKERS: React with 👍 to lock this project to your name.")
+            embed.set_footer(text="React with 👍 to claim.")
 
-            channel = interaction.guild.get_channel(WORKER_CHANNEL_ID)
-            if channel:
-                msg = await channel.send(embed=embed)
-                await msg.add_reaction("👍")
-                cursor.execute('UPDATE projects SET message_id = ? WHERE ticket_id = ?', (msg.id, t_id))
+            # Sends to the same channel the command was used in
+            msg = await interaction.channel.send(embed=embed)
+            await msg.add_reaction("👍")
             
+            cursor.execute('UPDATE projects SET message_id = ? WHERE ticket_id = ?', (msg.id, t_id))
             conn.commit()
             conn.close()
-            await interaction.response.send_message(f"✅ Ticket #{t_id} published.", ephemeral=True)
+            await interaction.response.send_message(f"✅ Ticket #{t_id} is live.", ephemeral=True)
         except Exception as e:
             await interaction.response.send_message(f"❌ Error: {e}", ephemeral=True)
 
@@ -77,11 +77,12 @@ class LedgerBot(discord.Client):
         self.tree = app_commands.CommandTree(self)
 
     async def setup_hook(self):
+        # Global Sync: Makes commands available in ALL servers
         await self.tree.sync()
 
     async def on_ready(self):
         init_db()
-        print(f'System Online: {self.user}')
+        print(f'Bot Publicly Active: {self.user}')
 
     async def on_raw_reaction_add(self, payload):
         if payload.user_id == self.user.id: return
@@ -95,104 +96,77 @@ class LedgerBot(discord.Client):
                                (payload.user_id, payload.member.name, res[0]))
                 conn.commit()
                 channel = self.get_channel(payload.channel_id)
-                await channel.send(f"💼 **#{res[0]}** is now locked by {payload.member.mention}.")
+                await channel.send(f"💼 **#{res[0]}** claimed by {payload.member.mention}.")
             conn.close()
 
 bot = LedgerBot()
 
-# --- THE COMMAND LEDGER ---
+# --- PUBLIC COMMANDS ---
 
-@bot.tree.command(name="post_job", description="CLIENT: Create a new project ticket for workers.")
+@bot.tree.command(name="post_job", description="MANAGER: Create a new project ticket.")
+@app_commands.checks.has_permissions(manage_messages=True)
 async def post_job(interaction: discord.Interaction):
-    """Admin/Client tool to post work into the public channel."""
+    """Requires 'Manage Messages' permission so any server admin can use it."""
     await interaction.response.send_modal(ProjectForm())
 
-@bot.tree.command(name="approve_work", description="CLIENT: Finalize work, log the output (clips/pages), and queue for payout.")
-@app_commands.describe(ticket_id="Job ID", output_count="Number of units produced (e.g. 5 clips)")
-async def approve_work(interaction: discord.Interaction, ticket_id: int, output_count: int):
-    """Acts as the Auditor. Logs work into the 'Owed' ledger."""
+@bot.tree.command(name="approve_work", description="MANAGER: Finalize work and log units.")
+@app_commands.checks.has_permissions(manage_messages=True)
+async def approve_work(interaction: discord.Interaction, ticket_id: int, units: int):
     conn = sqlite3.connect('business_ledger.db')
     cursor = conn.cursor()
-    cursor.execute('UPDATE projects SET status = "APPROVED", units = ? WHERE ticket_id = ? AND status != "PAID"', (output_count, ticket_id))
+    # Filters by guild_id so admins only see THEIR server's data
+    cursor.execute('UPDATE projects SET status = "APPROVED", units = ? WHERE ticket_id = ? AND guild_id = ?', 
+                   (units, ticket_id, interaction.guild_id))
     
     if cursor.rowcount > 0:
-        await interaction.response.send_message(f"✅ Ticket #{ticket_id} moved to Pending Payouts. logged {output_count} units.")
+        await interaction.response.send_message(f"✅ Ticket #{ticket_id} approved for payout.")
     else:
-        await interaction.response.send_message("❌ Invalid Ticket ID or status.", ephemeral=True)
+        await interaction.response.send_message("❌ Ticket not found in this server.", ephemeral=True)
     conn.commit()
     conn.close()
 
-@bot.tree.command(name="request_revision", description="CLIENT: Send job back to worker for changes. Pauses payout.")
-@app_commands.describe(ticket_id="Job ID", reason="What needs to be changed?")
-async def request_revision(interaction: discord.Interaction, ticket_id: int, reason: str):
-    """The Project Manager tool. DMs the worker and blocks payment until fixed."""
+@bot.tree.command(name="payout_list", description="ADMIN: View outstanding debt in this server.")
+@app_commands.checks.has_permissions(administrator=True)
+async def payout_list(interaction: discord.Interaction):
     conn = sqlite3.connect('business_ledger.db')
     cursor = conn.cursor()
-    cursor.execute('SELECT worker_id, title FROM projects WHERE ticket_id = ?', (ticket_id,))
-    row = cursor.fetchone()
-    
-    if row:
-        cursor.execute('UPDATE projects SET status = "REVISION" WHERE ticket_id = ?', (ticket_id,))
-        worker = await bot.fetch_user(row[0])
-        await worker.send(f"⚠️ **Revision Required** on Job #{ticket_id} ({row[1]})\n**Note:** {reason}")
-        await interaction.response.send_message(f"🔄 Revision request sent to worker.")
-    else:
-        await interaction.response.send_message("❌ Ticket ID not found.", ephemeral=True)
-    conn.commit()
-    conn.close()
-
-@bot.tree.command(name="ledger_payouts", description="ADMIN: View total debt owed to all freelancers.")
-async def ledger_payouts(interaction: discord.Interaction):
-    """The Accountant's balance sheet. Shows exactly who to pay and how much."""
-    if interaction.user.id != ADMIN_ID:
-        return await interaction.response.send_message("🚫 Admin Access Only.", ephemeral=True)
-
-    conn = sqlite3.connect('business_ledger.db')
-    cursor = conn.cursor()
-    cursor.execute("SELECT worker_name, SUM(units) FROM projects WHERE status = 'APPROVED' GROUP BY worker_name")
+    cursor.execute("SELECT worker_name, SUM(units) FROM projects WHERE status = 'APPROVED' AND guild_id = ? GROUP BY worker_name", 
+                   (interaction.guild_id,))
     rows = cursor.fetchall()
     
-    embed = discord.Embed(title="💰 Current Outstanding Debt", color=discord.Color.gold())
+    embed = discord.Embed(title="💰 Unpaid Balances", color=discord.Color.gold())
     if not rows:
-        embed.description = "No outstanding debt. All workers are paid up."
+        embed.description = "Ledger is clean."
     else:
-        for name, total_units in rows:
-            # Assuming 1 unit = 1 Rupee for the ledger, adjust logic if needed
-            embed.add_field(name=f"Worker: {name}", value=f"Total Units: {total_units} ➔ **₹{total_units}**", inline=False)
+        for name, total in rows:
+            embed.add_field(name=name, value=f"Total Owed: ₹{total}", inline=False)
     
     await interaction.response.send_message(embed=embed)
     conn.close()
 
-@bot.tree.command(name="settle_all", description="ADMIN: Reset the ledger to zero after paying workers.")
-async def settle_all(interaction: discord.Interaction):
-    """Finalizes the payment cycle. Moves all 'Approved' jobs to 'Paid'."""
-    if interaction.user.id != ADMIN_ID:
-        return await interaction.response.send_message("🚫 Admin Access Only.", ephemeral=True)
-
+@bot.tree.command(name="settle_server", description="ADMIN: Reset this server's ledger to zero.")
+@app_commands.checks.has_permissions(administrator=True)
+async def settle_server(interaction: discord.Interaction):
     conn = sqlite3.connect('business_ledger.db')
     cursor = conn.cursor()
-    cursor.execute("UPDATE projects SET status = 'PAID' WHERE status = 'APPROVED'")
+    cursor.execute("UPDATE projects SET status = 'PAID' WHERE status = 'APPROVED' AND guild_id = ?", (interaction.guild_id,))
     conn.commit()
     conn.close()
-    await interaction.response.send_message("📉 Ledger Cleared. All balances reset to ₹0.")
+    await interaction.response.send_message("✅ Server ledger cleared.")
 
-@bot.tree.command(name="performance_report", description="ADMIN: See a summary of completed jobs per worker.")
-async def performance_report(interaction: discord.Interaction):
-    """The Manager's productivity report."""
-    if interaction.user.id != ADMIN_ID:
-        return await interaction.response.send_message("🚫 Admin Access Only.", ephemeral=True)
-
+@bot.tree.command(name="system_status", description="DEVELOPER: Check bot health and total database size.")
+async def system_status(interaction: discord.Interaction):
+    """Only YOU (Yahya) can see the global bot health."""
+    if interaction.user.id != OWNER_ID:
+        return await interaction.response.send_message("🚫 Developer Only.", ephemeral=True)
+    
     conn = sqlite3.connect('business_ledger.db')
     cursor = conn.cursor()
-    cursor.execute("SELECT worker_name, COUNT(ticket_id) FROM projects WHERE status = 'PAID' GROUP BY worker_name")
-    rows = cursor.fetchall()
-    
-    embed = discord.Embed(title="📊 Productivity Report", color=discord.Color.green())
-    for name, count in rows:
-        embed.add_field(name=name, value=f"Finished Projects: {count}", inline=True)
-    
-    await interaction.response.send_message(embed=embed)
+    cursor.execute("SELECT COUNT(*) FROM projects")
+    total_jobs = cursor.fetchone()[0]
     conn.close()
+    
+    await interaction.response.send_message(f"🛡️ **System Status**: Online\n📊 **Total Jobs Tracked (Global)**: {total_jobs}", ephemeral=True)
 
 if __name__ == "__main__":
     bot.run(TOKEN)
