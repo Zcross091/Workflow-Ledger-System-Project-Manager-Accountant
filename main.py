@@ -7,7 +7,7 @@ from dotenv import load_dotenv
 # --- CONFIGURATION ---
 load_dotenv()
 TOKEN = os.getenv('DISCORD_TOKEN')
-# This is your unique ID (Yahya) for "Super Admin" actions like clearing the whole database
+# This is your unique ID for "Super Admin" actions like clearing the whole database
 OWNER_ID = 930518448268804096 
 
 # --- DATABASE LAYER ---
